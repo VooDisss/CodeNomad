@@ -4,6 +4,7 @@ import UnifiedPicker from "./unified-picker"
 import ExpandButton from "./expand-button"
 import { getAttachments, clearAttachments, removeAttachment } from "../stores/attachments"
 import { resolvePastedPlaceholders } from "../lib/prompt-placeholders"
+import { safeRequestAnimationFrame } from "../lib/raf-protection"
 import Kbd from "./kbd"
 import { getActiveInstance } from "../stores/instances"
 import { agents, executeCustomCommand } from "../stores/sessions"
@@ -21,7 +22,7 @@ const log = getLogger("actions")
 
 export default function PromptInput(props: PromptInputProps) {
   const { t } = useI18n()
-  const [, setIsFocused] = createSignal(false)
+  const [isFocused, setIsFocused] = createSignal(false)
   const [mode, setMode] = createSignal<PromptMode>("normal")
   const [expandState, setExpandState] = createSignal<ExpandState>("normal")
   const SELECTION_INSERT_MAX_LENGTH = 2000
@@ -176,6 +177,44 @@ export default function PromptInput(props: PromptInputProps) {
   )
 
   onMount(() => {
+    // Handle mobile keyboard viewport changes
+    let originalViewportHeight = typeof window !== "undefined" ? window.innerHeight : 0
+    let keyboardVisible = false
+    
+    const handleViewportChange = () => {
+      if (typeof window === "undefined") return
+      
+      const currentHeight = window.innerHeight
+      const heightDiff = originalViewportHeight - currentHeight
+      
+      // Detect if keyboard is likely visible (height decreased by more than 100px)
+      if (heightDiff > 100 && !keyboardVisible) {
+        keyboardVisible = true
+        // Ensure input stays visible when keyboard appears
+        if (textareaRef && isFocused()) {
+          safeRequestAnimationFrame('scroll', () => {
+            textareaRef.scrollIntoView({ block: "nearest", behavior: "auto" })
+          })
+        }
+      } else if (heightDiff < 50 && keyboardVisible) {
+        keyboardVisible = false
+        // Handle keyboard dismissal
+        if (textareaRef && isFocused()) {
+          // Ensure the input remains visible after keyboard dismissal
+          safeRequestAnimationFrame('scroll', () => {
+            const container = textareaRef.closest('.message-stream')
+            if (container) {
+              const containerRect = container.getBoundingClientRect()
+              const inputRect = textareaRef.getBoundingClientRect()
+              if (inputRect.bottom > containerRect.bottom) {
+                container.scrollTop = Math.max(0, container.scrollTop - (inputRect.bottom - containerRect.bottom) - 20)
+              }
+            }
+          })
+        }
+      }
+    }
+
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
       const activeElement = document.activeElement as HTMLElement
 
@@ -200,9 +239,11 @@ export default function PromptInput(props: PromptInputProps) {
     }
 
     document.addEventListener("keydown", handleGlobalKeyDown)
+    window.addEventListener("resize", handleViewportChange)
 
     onCleanup(() => {
       document.removeEventListener("keydown", handleGlobalKeyDown)
+      window.removeEventListener("resize", handleViewportChange)
     })
   })
 
@@ -288,6 +329,19 @@ export default function PromptInput(props: PromptInputProps) {
     setExpandState(nextState)
     // Keep focus on textarea
     textareaRef?.focus()
+    
+    // In fullscreen mode, prevent unwanted scrolling by maintaining scroll position
+    if (typeof document !== "undefined" && document.fullscreenElement) {
+      // Get current scroll position before expansion
+      const scrollContainer = textareaRef?.closest('.message-stream')
+      if (scrollContainer) {
+        const scrollTop = scrollContainer.scrollTop
+        // Restore scroll position after a brief delay to allow layout to settle
+        safeRequestAnimationFrame('scroll', () => {
+          scrollContainer.scrollTop = scrollTop
+        })
+      }
+    }
   }
 
   function insertBlockContent(block: string) {

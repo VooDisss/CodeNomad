@@ -62,7 +62,32 @@ export const SessionView: Component<SessionViewProps> = (props) => {
   function scheduleScrollToBottom() {
     if (!scrollToBottomHandle) return
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => scrollToBottomHandle?.())
+      requestAnimationFrame(() => {
+        scrollToBottomHandle?.()
+        
+        // Ensure input visibility regardless of fullscreen mode
+        if (typeof document !== "undefined") {
+          requestAnimationFrame(() => {
+            const promptInput = rootRef?.querySelector('.prompt-input-container') as HTMLElement
+            if (promptInput && rootRef) {
+              const rootRect = rootRef.getBoundingClientRect()
+              const inputRect = promptInput.getBoundingClientRect()
+              
+              // Check if input is obscured
+              if (inputRect.bottom > rootRect.bottom || inputRect.top < rootRect.top) {
+                // Adjust scroll to make input visible
+                const adjustment = inputRect.bottom > rootRect.bottom 
+                  ? inputRect.bottom - rootRect.bottom + 20
+                  : inputRect.top - rootRect.top - 20
+                
+                if (rootRef.scrollTop !== undefined) {
+                  rootRef.scrollTop = Math.max(0, rootRef.scrollTop + adjustment)
+                }
+              }
+            }
+          })
+        }
+      })
     })
   }
   createEffect(() => {

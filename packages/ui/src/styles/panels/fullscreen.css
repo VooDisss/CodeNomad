@@ -1,0 +1,150 @@
+/* Fullscreen mode styles */
+:fullscreen .session-view {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+:fullscreen .message-stream-container {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+:fullscreen .message-stream-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+:fullscreen .message-stream {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+:fullscreen .prompt-input-container {
+  flex-shrink: 0;
+  max-height: 50vh;
+  position: relative;
+  z-index: 10;
+}
+
+:fullscreen .prompt-input-field-container.is-expanded {
+  max-height: 40vh;
+}
+
+:fullscreen .prompt-input.is-expanded {
+  max-height: 35vh;
+}
+
+/* Ensure proper scrolling behavior in fullscreen */
+:fullscreen .message-block-list {
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+/* Handle the scroll indicators in fullscreen */
+:fullscreen .message-scroll-button-wrapper {
+  position: absolute;
+  right: 1rem;
+  bottom: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  z-index: 10;
+}
+
+/* Ensure the prompt input doesn't cause layout shifts */
+:fullscreen .prompt-input-wrapper {
+  position: relative;
+  z-index: 5;
+}
+
+/* Handle the case when prompt input is expanded in fullscreen */
+:fullscreen .prompt-input-field-container {
+  transition: height 0.2s ease;
+}
+
+/* Prevent scrolling issues when input expands */
+:fullscreen .message-stream {
+  scroll-padding-bottom: 200px;
+}
+
+/* Ensure proper focus behavior in fullscreen */
+:fullscreen .prompt-input:focus {
+  scroll-margin-bottom: 100px;
+}
+
+/* Ensure the prompt input is always visible in fullscreen */
+:fullscreen .prompt-input-container {
+  background-color: var(--surface-base);
+  border-top: 1px solid var(--border-base);
+  box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.1);
+}
+
+/* Prevent the input from being obscured by scroll buttons */
+:fullscreen .message-scroll-button-wrapper {
+  bottom: calc(1rem + 80px); /* Account for prompt input height */
+}
+
+/* Remove transitions in fullscreen to prevent layout glitches */
+:fullscreen .prompt-input-field-container,
+:fullscreen .prompt-input {
+  transition: none;
+}
+
+/* Ensure the input is visible after keyboard dismissal */
+:fullscreen .prompt-input:focus {
+  scroll-margin-bottom: 100px;
+  outline: none;
+}
+
+/* Enhanced overscroll behavior to prevent bounce and oscillation */
+:fullscreen .message-stream {
+  overscroll-behavior: contain;     /* Prevent scroll chaining */
+  -webkit-overflow-scrolling: auto; /* Disable momentum scrolling */
+  scroll-behavior: auto;           /* Disable smooth scrolling */
+  scroll-snap-type: none;          /* Disable scroll snapping */
+}
+
+:fullscreen .message-stream-shell {
+  overscroll-behavior: contain;
+}
+
+:fullscreen .message-stream-container {
+  overscroll-behavior: contain;
+}
+
+/* Mobile-specific fixes for keyboard issues */
+@media (max-width: 768px) {
+  :fullscreen .prompt-input-container {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 1000;
+    max-height: 40vh;
+  }
+  
+  :fullscreen .message-stream {
+    padding-bottom: 80px; /* Account for fixed input */
+  }
+  
+  :fullscreen .message-scroll-button-wrapper {
+    bottom: calc(1rem + 100px); /* Extra space for mobile keyboard */
+  }
+}
+
+/* Handle mobile keyboard visibility */
+@media (pointer: coarse) {
+  :fullscreen .prompt-input-container {
+    position: relative;
+    z-index: 10;
+  }
+}

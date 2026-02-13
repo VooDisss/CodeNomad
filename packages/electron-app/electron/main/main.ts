@@ -1,4 +1,4 @@
-import { app, BrowserView, BrowserWindow, nativeImage, session, shell } from "electron"
+import { app, BrowserWindow, nativeImage, session, shell } from "electron"
 import http from "node:http"
 import https from "node:https"
 import { existsSync } from "fs"
@@ -19,11 +19,17 @@ let currentCliUrl: string | null = null
 let pendingCliUrl: string | null = null
 let pendingBootstrapToken: string | null = null
 let showingLoadingScreen = false
-let preloadingView: BrowserView | null = null
+let preloadingWebContents: Electron.WebContents | null = null
 
 if (isMac) {
   app.commandLine.appendSwitch("disable-spell-checking")
 }
+
+// Disable smooth scrolling to prevent scroll oscillation issues
+app.commandLine.appendSwitch("disable-smooth-scrolling")
+
+// Control scroll behavior to prevent bounce and oscillation
+app.commandLine.appendSwitch("disable-scroll-anchoring")
 
 function getIconPath() {
   if (app.isPackaged) {
@@ -168,21 +174,24 @@ function getPreloadPath() {
   return join(mainDirname, "../preload/index.js")
 }
 
-function destroyPreloadingView(target?: BrowserView | null) {
-  const view = target ?? preloadingView
-  if (!view) {
+function destroyPreloadingView(target?: Electron.WebContents | null) {
+  const contents = target ?? preloadingWebContents
+  if (!contents) {
     return
   }
 
   try {
-    const contents = view.webContents as any
-    contents?.destroy?.()
+    // Get the window from webContents and close it
+    const window = BrowserWindow.fromWebContents(contents)
+    if (window && !window.isDestroyed()) {
+      window.close()
+    }
   } catch (error) {
     console.warn("[cli] failed to destroy preloading view", error)
   }
 
-  if (!target || view === preloadingView) {
-    preloadingView = null
+  if (!target || contents === preloadingWebContents) {
+    preloadingWebContents = null
   }
 }
 
@@ -191,7 +200,7 @@ function createWindow() {
   const backgroundColor = prefersDark ? "#1a1a1a" : "#ffffff"
   const iconPath = getIconPath()
 
-  mainWindow = new BrowserWindow({
+   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
     minWidth: 800,
@@ -203,6 +212,10 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       spellcheck: !isMac,
+      // Disable scroll bounce to prevent oscillation issues
+      scrollBounce: false,
+      // Control smooth scrolling behavior
+      enableBlinkFeatures: "CSSOMSmoothScroll",
     },
   })
 
@@ -287,7 +300,8 @@ function startCliPreload(url: string) {
     return
   }
 
-  const view = new BrowserView({
+  const hiddenWindow = new BrowserWindow({
+    show: false,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -295,20 +309,20 @@ function startCliPreload(url: string) {
     },
   })
 
-  preloadingView = view
+  preloadingWebContents = hiddenWindow.webContents
 
-  view.webContents.once("did-finish-load", () => {
-    if (preloadingView !== view) {
-      destroyPreloadingView(view)
+  hiddenWindow.webContents.once("did-finish-load", () => {
+    if (preloadingWebContents !== hiddenWindow.webContents) {
+      destroyPreloadingView(hiddenWindow.webContents)
       return
     }
     finalizeCliSwap(url)
   })
 
-  view.webContents.loadURL(url).catch((error) => {
+  hiddenWindow.webContents.loadURL(url).catch((error: any) => {
     console.error("[cli] failed to preload CLI view:", error)
-    if (preloadingView === view) {
-      destroyPreloadingView(view)
+    if (preloadingWebContents === hiddenWindow.webContents) {
+      destroyPreloadingView(hiddenWindow.webContents)
     }
   })
 }

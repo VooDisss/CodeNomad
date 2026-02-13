@@ -51,6 +51,9 @@ export const instanceMessages = {
   "instanceShell.connection.disconnected": "Desconectada",
   "instanceShell.connection.unknown": "Desconocida",
 
+  "instanceShell.fullscreen.toggle.enter": "Pantalla completa",
+  "instanceShell.fullscreen.toggle.exit": "Salir de pantalla completa",
+
   "instanceWelcome.shortcuts.newSession": "Nueva sesión",
   "instanceWelcome.empty.title": "No hay sesiones anteriores",
   "instanceWelcome.empty.description": "Crea una nueva sesión abajo para comenzar",

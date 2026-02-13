@@ -9,6 +9,7 @@ import { useScrollCache } from "../lib/hooks/use-scroll-cache"
 import { useI18n } from "../lib/i18n"
 import { copyToClipboard } from "../lib/clipboard"
 import { showToastNotification } from "../lib/notifications"
+import { safeRequestAnimationFrame, cancelSafeRAF, isRAFPending } from "../lib/raf-protection"
 import type { InstanceMessageStore } from "../stores/message-v2/instance-store"
 
 const SCROLL_SCOPE = "session"
@@ -76,7 +77,7 @@ export default function MessageSection(props: MessageSectionProps) {
   const handleTimelineSegmentClick = (segment: TimelineSegment) => {
     if (typeof document === "undefined") return
     const anchor = document.getElementById(getMessageAnchorId(segment.messageId))
-    anchor?.scrollIntoView({ block: "start", behavior: "smooth" })
+    anchor?.scrollIntoView({ block: "start", behavior: "auto" })
   }
  
   const lastAssistantIndex = createMemo(() => {
@@ -250,7 +251,7 @@ export default function MessageSection(props: MessageSectionProps) {
 
   function scheduleScrollPersist() {
     if (pendingScrollPersist !== null) return
-    pendingScrollPersist = requestAnimationFrame(() => {
+    pendingScrollPersist = safeRequestAnimationFrame('scroll', () => {
       pendingScrollPersist = null
       if (!containerRef) return
       // scrollCache.persist(containerRef, { atBottomOffset: SCROLL_SENTINEL_MARGIN_PX })
@@ -260,23 +261,42 @@ export default function MessageSection(props: MessageSectionProps) {
   function scrollToBottom(immediate = false, options?: { suppressAutoAnchor?: boolean }) {
     if (!containerRef) return
     const sentinel = bottomSentinel()
-    const behavior = immediate ? "auto" : "smooth"
+    // Always use immediate behavior to prevent animation glitches
+    const behavior = "auto"
     const suppressAutoAnchor = options?.suppressAutoAnchor ?? !immediate
     if (suppressAutoAnchor) {
       suppressAutoScrollOnce = true
     }
-    sentinel?.scrollIntoView({ block: "end", inline: "nearest", behavior })
+    
+    // In fullscreen mode, use a different approach to prevent input hiding
+    if (typeof document !== "undefined" && document.fullscreenElement) {
+      // Instead of scrolling to sentinel, scroll to just above the input area
+      const promptInput = document.querySelector('.prompt-input-container') as HTMLElement
+      if (promptInput && sentinel) {
+        const inputHeight = promptInput.offsetHeight
+        const targetScroll = sentinel.offsetTop - containerRef.offsetTop - inputHeight - 20
+        containerRef.scrollTo({
+          top: Math.max(0, targetScroll),
+          behavior: "auto" // Use immediate behavior
+        })
+      } else {
+        sentinel?.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" })
+      }
+    } else {
+      sentinel?.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" })
+    }
+    
     setAutoScroll(true)
     scheduleScrollPersist()
   }
 
   function clearScrollToBottomFrames() {
     if (scrollToBottomFrame !== null) {
-      cancelAnimationFrame(scrollToBottomFrame)
+      cancelSafeRAF('scroll', scrollToBottomFrame)
       scrollToBottomFrame = null
     }
     if (scrollToBottomDelayedFrame !== null) {
-      cancelAnimationFrame(scrollToBottomDelayedFrame)
+      cancelSafeRAF('scroll', scrollToBottomDelayedFrame)
       scrollToBottomDelayedFrame = null
     }
   }
@@ -292,9 +312,9 @@ export default function MessageSection(props: MessageSectionProps) {
     }
     pendingActiveScroll = false
     clearScrollToBottomFrames()
-    scrollToBottomFrame = requestAnimationFrame(() => {
+    scrollToBottomFrame = safeRequestAnimationFrame('scroll', () => {
       scrollToBottomFrame = null
-      scrollToBottomDelayedFrame = requestAnimationFrame(() => {
+      scrollToBottomDelayedFrame = safeRequestAnimationFrame('scroll', () => {
         scrollToBottomDelayedFrame = null
         scrollToBottom(immediate)
       })
@@ -309,7 +329,7 @@ export default function MessageSection(props: MessageSectionProps) {
  
   function scrollToTop(immediate = false) {
     if (!containerRef) return
-    const behavior = immediate ? "auto" : "smooth"
+    const behavior = "auto" // Always use immediate to prevent animation glitches
     setAutoScroll(false)
     topSentinel()?.scrollIntoView({ block: "start", inline: "nearest", behavior })
     scheduleScrollPersist()
@@ -328,12 +348,12 @@ export default function MessageSection(props: MessageSectionProps) {
       return
     }
     if (pendingAnchorScroll !== null) {
-      cancelAnimationFrame(pendingAnchorScroll)
+      cancelSafeRAF('scroll', pendingAnchorScroll)
       pendingAnchorScroll = null
     }
-    pendingAnchorScroll = requestAnimationFrame(() => {
+    pendingAnchorScroll = safeRequestAnimationFrame('scroll', () => {
       pendingAnchorScroll = null
-      sentinel.scrollIntoView({ block: "end", inline: "nearest", behavior: immediate ? "auto" : "smooth" })
+      sentinel.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" })
     })
   }
 
@@ -434,10 +454,10 @@ export default function MessageSection(props: MessageSectionProps) {
 
     if (!containerRef) return
     if (pendingScrollFrame !== null) {
-      cancelAnimationFrame(pendingScrollFrame)
+      cancelSafeRAF('scroll', pendingScrollFrame)
     }
     const isUserScroll = hasUserScrollIntent()
-    pendingScrollFrame = requestAnimationFrame(() => {
+    pendingScrollFrame = safeRequestAnimationFrame('scroll', () => {
       pendingScrollFrame = null
       if (!containerRef) return
       const atBottom = bottomSentinelVisible()
@@ -452,6 +472,22 @@ export default function MessageSection(props: MessageSectionProps) {
 
       clearQuoteSelection()
       scheduleScrollPersist()
+      
+      // In fullscreen mode, ensure the prompt input remains visible
+      if (typeof document !== "undefined" && document.fullscreenElement && atBottom && isUserScroll) {
+        // Prevent auto-scroll from hiding the input when user scrolls to bottom
+        const promptInput = document.querySelector('.prompt-input-container') as HTMLElement
+        if (promptInput) {
+          // Ensure the input is not obscured by maintaining a minimum scroll position
+          const containerRect = containerRef.getBoundingClientRect()
+          const inputRect = promptInput.getBoundingClientRect()
+          if (inputRect.bottom > containerRect.bottom) {
+            // Adjust scroll to keep input visible
+            const adjustment = inputRect.bottom - containerRect.bottom + 20
+            containerRef.scrollTop = Math.max(0, containerRef.scrollTop - adjustment)
+          }
+        }
+      }
     })
 
   }
@@ -509,7 +545,7 @@ export default function MessageSection(props: MessageSectionProps) {
       timelinePartCountsByMessageId.clear()
       pendingTimelineMessagePartUpdates.clear()
       if (pendingTimelinePartUpdateFrame !== null) {
-        cancelAnimationFrame(pendingTimelinePartUpdateFrame)
+        cancelSafeRAF('scroll', pendingTimelinePartUpdateFrame)
         pendingTimelinePartUpdateFrame = null
       }
       return
@@ -593,7 +629,7 @@ export default function MessageSection(props: MessageSectionProps) {
 
   function scheduleTimelinePartUpdateFlush() {
     if (pendingTimelinePartUpdateFrame !== null) return
-    pendingTimelinePartUpdateFrame = requestAnimationFrame(() => {
+    pendingTimelinePartUpdateFrame = safeRequestAnimationFrame('scroll', () => {
       pendingTimelinePartUpdateFrame = null
       if (pendingTimelineMessagePartUpdates.size === 0) return
       const changedIds = Array.from(pendingTimelineMessagePartUpdates)
@@ -830,13 +866,13 @@ export default function MessageSection(props: MessageSectionProps) {
 
 
     if (pendingScrollFrame !== null) {
-      cancelAnimationFrame(pendingScrollFrame)
+      cancelSafeRAF('scroll', pendingScrollFrame)
     }
     if (pendingScrollPersist !== null) {
-      cancelAnimationFrame(pendingScrollPersist)
+      cancelSafeRAF('scroll', pendingScrollPersist)
     }
     if (pendingAnchorScroll !== null) {
-      cancelAnimationFrame(pendingAnchorScroll)
+      cancelSafeRAF('scroll', pendingAnchorScroll)
     }
     clearScrollToBottomFrames()
     clearPendingTimelinePartUpdateFrame()

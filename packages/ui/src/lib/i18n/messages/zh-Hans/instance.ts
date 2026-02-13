@@ -51,6 +51,9 @@ export const instanceMessages = {
   "instanceShell.connection.disconnected": "已断开",
   "instanceShell.connection.unknown": "未知",
 
+  "instanceShell.fullscreen.toggle.enter": "进入全屏",
+  "instanceShell.fullscreen.toggle.exit": "退出全屏",
+
   "instanceWelcome.shortcuts.newSession": "新建会话",
   "instanceWelcome.empty.title": "没有历史会话",
   "instanceWelcome.empty.description": "在下方创建新会话以开始使用",

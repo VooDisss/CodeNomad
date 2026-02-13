@@ -41,7 +41,7 @@ import { useSessionSidebarRequests } from "./shell/useSessionSidebarRequests"
 import RightPanel from "./shell/right-panel/RightPanel"
 import { useDrawerChrome } from "./shell/useDrawerChrome"
 import { getSessionStatus } from "../../stores/session-status"
-import { ShieldAlert } from "lucide-solid"
+import { ShieldAlert, Maximize2, Minimize2 } from "lucide-solid"
 
 import type { LayoutMode } from "./shell/types"
 import {
@@ -87,6 +87,7 @@ const InstanceShell2: Component<InstanceShellProps> = (props) => {
   const [selectedBackgroundProcess, setSelectedBackgroundProcess] = createSignal<BackgroundProcess | null>(null)
   const [showBackgroundOutput, setShowBackgroundOutput] = createSignal(false)
   const [permissionModalOpen, setPermissionModalOpen] = createSignal(false)
+  const [isFullscreen, setIsFullscreen] = createSignal(false)
 
   // Worktree selector manages its own dialogs.
   const [showSessionSearch, setShowSessionSearch] = createSignal(false)
@@ -286,6 +287,36 @@ const InstanceShell2: Component<InstanceShellProps> = (props) => {
   const handleCommandPaletteClick = () => {
     showCommandPalette(props.instance.id)
   }
+
+  const handleFullscreenToggle = () => {
+    if (typeof window !== "undefined") {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().then(() => {
+          setIsFullscreen(true)
+        }).catch((error) => {
+          console.warn("Failed to enter fullscreen:", error)
+        })
+      } else {
+        document.exitFullscreen().then(() => {
+          setIsFullscreen(false)
+        }).catch((error) => {
+          console.warn("Failed to exit fullscreen:", error)
+        })
+      }
+    }
+  }
+
+  // Listen for fullscreen changes
+  onMount(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement))
+    }
+    
+    document.addEventListener("fullscreenchange", handleFullscreenChange)
+    onCleanup(() => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange)
+    })
+  })
 
   const openBackgroundOutput = (process: BackgroundProcess) => {
     setSelectedBackgroundProcess(process)
@@ -647,18 +678,32 @@ const InstanceShell2: Component<InstanceShellProps> = (props) => {
                       </span>
                     </div>
 
-                    <Show when={rightDrawerState() === "floating-closed"}>
-                      <IconButton
-                        ref={setRightToggleButtonEl}
-                        color="inherit"
-                        onClick={handleRightAppBarButtonClick}
-                        aria-label={rightAppBarButtonLabel()}
-                        size="small"
-                        aria-expanded={rightDrawerState() !== "floating-closed"}
-                      >
-                        {rightAppBarButtonIcon()}
-                      </IconButton>
-                    </Show>
+                   <Show when={rightDrawerState() === "floating-closed"}>
+                     <IconButton
+                       ref={setRightToggleButtonEl}
+                       color="inherit"
+                       onClick={handleRightAppBarButtonClick}
+                       aria-label={rightAppBarButtonLabel()}
+                       size="small"
+                       aria-expanded={rightDrawerState() !== "floating-closed"}
+                     >
+                       {rightAppBarButtonIcon()}
+                     </IconButton>
+                   </Show>
+                   
+                   <IconButton
+                     color="inherit"
+                     onClick={handleFullscreenToggle}
+                     aria-label={isFullscreen() ? t("instanceShell.fullscreen.toggle.exit") : t("instanceShell.fullscreen.toggle.enter")}
+                     size="small"
+                   >
+                     <Show
+                       when={isFullscreen()}
+                       fallback={<Maximize2 class="h-4 w-4" aria-hidden="true" />}
+                     >
+                       <Minimize2 class="h-4 w-4" aria-hidden="true" />
+                     </Show>
+                   </IconButton>
                   </div>
 
                   <div class="flex flex-wrap items-center justify-center gap-2 pb-1">

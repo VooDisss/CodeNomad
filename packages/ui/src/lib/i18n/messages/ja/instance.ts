@@ -51,6 +51,9 @@ export const instanceMessages = {
   "instanceShell.connection.disconnected": "切断",
   "instanceShell.connection.unknown": "不明",
 
+  "instanceShell.fullscreen.toggle.enter": "全画面表示",
+  "instanceShell.fullscreen.toggle.exit": "全画面表示を終了",
+
   "instanceWelcome.shortcuts.newSession": "新しいセッション",
   "instanceWelcome.empty.title": "以前のセッションはありません",
   "instanceWelcome.empty.description": "下で新しいセッションを作成して開始",

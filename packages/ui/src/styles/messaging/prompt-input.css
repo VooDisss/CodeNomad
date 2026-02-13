@@ -45,7 +45,9 @@
   border-radius: 0;
   padding-bottom: 0;
   height: 100%;
-  min-height: 100%;
+  min-height: 56px; /* Ensure roughly 2 lines height minimum */
+  max-height: 140px; /* Limit to roughly 5 lines */
+  overflow-y: auto;
 }
 
 .prompt-input-field-container.is-expanded {
