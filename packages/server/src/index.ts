@@ -23,6 +23,7 @@ import { AuthManager, BOOTSTRAP_TOKEN_STDOUT_PREFIX, DEFAULT_AUTH_USERNAME } fro
 import { resolveHttpsOptions } from "./server/tls"
 import { resolveNetworkAddresses } from "./server/network-addresses"
 import { startDevReleaseMonitor } from "./releases/dev-release-monitor"
+import { upgradeServer, getCurrentVersion } from "./installation"
 
 const require = createRequire(import.meta.url)
 
@@ -63,11 +64,30 @@ const DEFAULT_CONFIG_PATH = "~/.config/codenomad/config.json"
 const DEFAULT_HTTPS_PORT = 9898
 const DEFAULT_HTTP_PORT = 9899
 
-function parseCliOptions(argv: string[]): CliOptions {
+function parseCliOptions(argv: string[]): CliOptions | null {
   const program = new Command()
     .name("codenomad")
     .description("CodeNomad CLI server")
     .version(packageJson.version, "-v, --version", "Show the CLI version")
+    .addCommand(
+      new Command("upgrade")
+        .description("Upgrade CodeNomad server to latest or specified version")
+        .argument("[version]", "Specific version to upgrade to")
+        .action(async (version?: string) => {
+          const result = await upgradeServer({
+            version,
+            logger: {
+              info: console.log,
+              warn: console.warn,
+              error: console.error,
+            },
+          })
+
+          if (!result.success) {
+            process.exit(1)
+          }
+        }),
+    )
     .addOption(new Option("--host <host>", "Host interface to bind").env("CLI_HOST").default(DEFAULT_HOST))
     .addOption(new Option("--https <enabled>", "Enable HTTPS listener (true|false)").env("CLI_HTTPS").default("true"))
     .addOption(new Option("--http <enabled>", "Enable HTTP listener (true|false)").env("CLI_HTTP").default("false"))
@@ -114,6 +134,11 @@ function parseCliOptions(argv: string[]): CliOptions {
     )
 
   program.parse(argv, { from: "user" })
+
+  if (program.args.length > 0 && program.args[0] === "upgrade") {
+    return null
+  }
+
   const parsed = program.opts<{
     host: string
     https?: string
@@ -217,7 +242,14 @@ function programHasArg(argv: string[], flag: string): boolean {
 }
 
 async function main() {
-  const options = parseCliOptions(process.argv.slice(2))
+  const argv = process.argv.slice(2)
+  const parseResult = parseCliOptions(argv)
+
+  if (parseResult === null) {
+    return
+  }
+
+  const options = parseResult
   const logger = createLogger({ level: options.logLevel, destination: options.logDestination, component: "app" })
   const workspaceLogger = logger.child({ component: "workspace" })
   const configLogger = logger.child({ component: "config" })
