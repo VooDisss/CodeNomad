@@ -44,6 +44,33 @@ export class WorkspaceManager {
     return this.workspaces.get(id)
   }
 
+  findWorkspaceIdsByDirectory(directory: string): string[] {
+    const normalized = normalizeWorkspacePath(directory)
+    if (!normalized) {
+      return []
+    }
+
+    const exactMatches: string[] = []
+    const containingMatches: string[] = []
+    for (const workspace of this.workspaces.values()) {
+      const workspacePath = normalizeWorkspacePath(workspace.path)
+      if (!workspacePath) {
+        continue
+      }
+
+      if (workspacePath === normalized) {
+        exactMatches.push(workspace.id)
+        continue
+      }
+
+      if (isSubpath(normalized, workspacePath)) {
+        containingMatches.push(workspace.id)
+      }
+    }
+
+    return exactMatches.length > 0 ? exactMatches : containingMatches
+  }
+
   getInstancePort(id: string): number | undefined {
     return this.workspaceHosts.getHostInfo(id)?.port
   }
@@ -203,4 +230,26 @@ export class WorkspaceManager {
       this.options.eventBus.publish({ type: "workspace.error", workspace })
     }
   }
+}
+
+function normalizeWorkspacePath(input: string): string {
+  const trimmed = input.trim()
+  if (!trimmed) {
+    return ""
+  }
+
+  try {
+    return path.normalize(trimmed)
+  } catch {
+    return trimmed
+  }
+}
+
+function isSubpath(candidate: string, root: string): boolean {
+  const rel = path.relative(root, candidate)
+  if (rel === "") return true
+  if (rel === "..") return false
+  if (rel.startsWith(`..${path.sep}`)) return false
+  if (path.isAbsolute(rel)) return false
+  return true
 }
