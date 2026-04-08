@@ -37,6 +37,7 @@ import { ClientConnectionManager } from "../clients/connection-manager"
 import { PluginChannelManager } from "../plugins/channel"
 import { VoiceModeManager } from "../plugins/voice-mode"
 import type { SideCarManager } from "../sidecars/manager"
+import type { SharedHostInfo } from "../workspaces/shared-host"
 
 interface HttpServerDeps {
   bindHost: string
@@ -494,7 +495,6 @@ async function proxyWorkspaceRequest(args: {
 }) {
   const { request, reply, workspaceManager, logger, worktreeSlug } = args
   const workspaceId = (request.params as { id: string }).id
-  const workspace = workspaceManager.get(workspaceId)
 
   const bodyToJson = (body: unknown): unknown => {
     if (body == null) return null
@@ -558,78 +558,41 @@ async function proxyWorkspaceRequest(args: {
     return body
   }
 
-  if (!workspace) {
-    reply.code(404).send({ error: "Workspace not found" })
-    return
-  }
-
-  const port = workspaceManager.getInstancePort(workspaceId)
-  if (!port) {
-    reply.code(502).send({ error: "Workspace instance is not ready" })
-    return
-  }
-
-  if (!isValidWorktreeSlug(worktreeSlug)) {
-    reply.code(400).send({ error: "Invalid worktree slug" })
-    return
-  }
-
-  let extracted: { overrideDirectory: string | null; forwardedSuffix: string | undefined }
+  let routingContext: WorkspaceRoutingContext
   try {
-    extracted = extractOpencodeDirectoryOverride(args.pathSuffix)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Invalid directory override"
-    reply.code(400).send({ error: message })
-    return
-  }
-  let directory: string | null = null
-  let forwardedSuffix = extracted.forwardedSuffix
-
-  if (extracted.overrideDirectory) {
-    try {
-      directory = validateAndNormalizeOverrideDirectory({
-        overrideDirectory: extracted.overrideDirectory,
-        workspaceRoot: workspace.path,
-      })
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Invalid directory override"
-      reply.code(400).send({ error: message })
-      return
-    }
-  } else {
-    directory = await resolveWorktreeDirectory({
+    routingContext = await resolveWorkspaceRoutingContext({
+      workspaceManager,
       workspaceId,
-      workspacePath: workspace.path,
       worktreeSlug,
+      pathSuffix: args.pathSuffix,
       logger,
     })
-
-    if (!directory) {
-      reply.code(404).send({ error: "Worktree not found" })
-      return
-    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Workspace instance is not ready"
+    const statusCode = getWorkspaceRoutingErrorStatus(error)
+    reply.code(statusCode).send({ error: message })
+    return
   }
 
-  const normalizedSuffix = normalizeInstanceSuffix(forwardedSuffix)
+  const normalizedSuffix = normalizeInstanceSuffix(routingContext.forwardedSuffix)
   const queryIndex = (request.raw.url ?? "").indexOf("?")
   const search = queryIndex >= 0 ? (request.raw.url ?? "").slice(queryIndex) : ""
-  const targetUrl = `http://${INSTANCE_PROXY_HOST}:${port}${normalizedSuffix}${search}`
-  const instanceAuthHeader = workspaceManager.getInstanceAuthorizationHeader(workspaceId)
+  const targetUrl = `${routingContext.host.baseUrl}${normalizedSuffix}${search}`
 
-  logger.debug({ workspaceId, method: request.method, targetUrl }, "Proxying request to instance")
+  logger.debug({ workspaceId, method: request.method, targetUrl }, "Proxying request to shared host")
   if (logger.isLevelEnabled("trace")) {
     logger.trace({ workspaceId, targetUrl, body: request.body }, "Instance proxy payload")
   }
 
   return reply.from(targetUrl, {
     rewriteRequestHeaders: (_originalRequest, headers) => {
-      if (instanceAuthHeader) {
-        headers.authorization = instanceAuthHeader
+      if (routingContext.host.authorization) {
+        headers.authorization = routingContext.host.authorization
       }
 
       // OpenCode expects the *full* path; we send it via header to avoid query tampering.
-      const isNonASCII = /[^\x00-\x7F]/.test(directory)
-      const encodedDirectory = isNonASCII ? encodeURIComponent(directory) : directory
+      const isNonASCII = /[^\x00-\x7F]/.test(routingContext.directory)
+      const encodedDirectory = isNonASCII ? encodeURIComponent(routingContext.directory) : routingContext.directory
 
       // Overwrite any client-provided value (case-insensitive headers are normalized by Node).
       ;(headers as Record<string, unknown>)["x-opencode-directory"] = encodedDirectory
@@ -654,7 +617,7 @@ async function proxyWorkspaceRequest(args: {
             method: request.method,
             targetUrl,
             worktreeSlug,
-            directory,
+            directory: routingContext.directory,
             contentType: request.headers["content-type"],
             body: bodyToJson(request.body),
             headers: outgoing,
@@ -672,6 +635,86 @@ async function proxyWorkspaceRequest(args: {
       }
     },
   })
+}
+
+type WorkspaceRoutingContext = {
+  workspace: ReturnType<WorkspaceManager["get"]>
+  directory: string
+  forwardedSuffix: string | undefined
+  host: SharedHostInfo
+}
+
+async function resolveWorkspaceRoutingContext(args: {
+  workspaceManager: WorkspaceManager
+  workspaceId: string
+  worktreeSlug: string
+  pathSuffix?: string
+  logger: Logger
+}): Promise<WorkspaceRoutingContext> {
+  const workspace = args.workspaceManager.get(args.workspaceId)
+  if (!workspace) {
+    throw new WorkspaceRoutingError(404, "Workspace not found")
+  }
+
+  if (!isValidWorktreeSlug(args.worktreeSlug)) {
+    throw new WorkspaceRoutingError(400, "Invalid worktree slug")
+  }
+
+  let extracted: { overrideDirectory: string | null; forwardedSuffix: string | undefined }
+  try {
+    extracted = extractOpencodeDirectoryOverride(args.pathSuffix)
+  } catch (error) {
+    throw new WorkspaceRoutingError(400, error instanceof Error ? error.message : "Invalid directory override")
+  }
+
+  let directory: string | null = null
+  if (extracted.overrideDirectory) {
+    try {
+      directory = validateAndNormalizeOverrideDirectory({
+        overrideDirectory: extracted.overrideDirectory,
+        workspaceRoot: workspace.path,
+      })
+    } catch (error) {
+      throw new WorkspaceRoutingError(400, error instanceof Error ? error.message : "Invalid directory override")
+    }
+  } else {
+    directory = await resolveWorktreeDirectory({
+      workspaceId: args.workspaceId,
+      workspacePath: workspace.path,
+      worktreeSlug: args.worktreeSlug,
+      logger: args.logger,
+    })
+
+    if (!directory) {
+      throw new WorkspaceRoutingError(404, "Worktree not found")
+    }
+  }
+
+  try {
+    const host = await args.workspaceManager.ensureSharedHostReady()
+    return {
+      workspace,
+      directory,
+      forwardedSuffix: extracted.forwardedSuffix,
+      host,
+    }
+  } catch (error) {
+    throw new WorkspaceRoutingError(502, error instanceof Error ? error.message : "Workspace instance is not ready")
+  }
+}
+
+class WorkspaceRoutingError extends Error {
+  constructor(
+    readonly statusCode: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = "WorkspaceRoutingError"
+  }
+}
+
+function getWorkspaceRoutingErrorStatus(error: unknown): number {
+  return error instanceof WorkspaceRoutingError ? error.statusCode : 502
 }
 
 function extractOpencodeDirectoryOverride(pathSuffix: string | undefined): {

@@ -7,7 +7,7 @@ import { searchWorkspaceFiles, WorkspaceFileSearchOptions } from "../filesystem/
 import { clearWorkspaceSearchCache } from "../filesystem/search-cache"
 import { WorkspaceDescriptor, WorkspaceFileResponse, FileSystemEntry } from "../api-types"
 import { Logger } from "../logger"
-import { SharedOpencodeHostManager } from "./shared-host"
+import { SharedHostInfo, SharedOpencodeHostManager } from "./shared-host"
 import { resolveBinaryPath } from "./binary-path"
 import { DedicatedWorkspaceHostManager } from "./workspace-hosts"
 
@@ -54,6 +54,10 @@ export class WorkspaceManager {
 
   getSharedHostManager(): SharedOpencodeHostManager {
     return this.sharedHost
+  }
+
+  async ensureSharedHostReady(): Promise<SharedHostInfo> {
+    return this.sharedHost.ensureStarted()
   }
 
   listFiles(workspaceId: string, relativePath = "."): FileSystemEntry[] {
@@ -113,6 +117,8 @@ export class WorkspaceManager {
     this.options.eventBus.publish({ type: "workspace.created", workspace: descriptor })
 
     try {
+      await this.sharedHost.ensureStarted()
+
       const hostInfo = await this.workspaceHosts.startWorkspaceHost({
         workspaceId: id,
         workspacePath,
