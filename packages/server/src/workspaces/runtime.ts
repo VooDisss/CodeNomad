@@ -1,5 +1,6 @@
 import { ChildProcess, spawn, spawnSync } from "child_process"
 import { existsSync, statSync } from "fs"
+import { connect } from "net"
 import path from "path"
 import { EventBus } from "../events/bus"
 import { LogLevel, WorkspaceLogEntry } from "../api-types"
@@ -9,6 +10,7 @@ export const WINDOWS_CMD_EXTENSIONS = new Set([".cmd", ".bat"])
 export const WINDOWS_POWERSHELL_EXTENSIONS = new Set([".ps1"])
 
 const VERSION_REGEX = /([0-9]+\.[0-9]+\.[0-9A-Za-z.-]+)/
+const STARTUP_STABILITY_DELAY_MS = 1500
 
 export function buildSpawnSpec(binaryPath: string, args: string[]) {
   if (process.platform !== "win32") {
@@ -132,12 +134,28 @@ interface ManagedProcess {
   requestedStop: boolean
 }
 
+export interface OpencodeServerLaunchResult {
+  pid: number
+  port: number
+  exitPromise: Promise<ProcessExitInfo>
+  getLastOutput: () => string
+}
+
+interface OpencodeReadinessParams {
+  runtimeId: string
+  port: number
+  exitPromise: Promise<ProcessExitInfo>
+  getLastOutput: () => string
+  logger: Logger
+  authorizationHeader?: string
+}
+
 export class WorkspaceRuntime {
   private processes = new Map<string, ManagedProcess>()
 
   constructor(private readonly eventBus: EventBus, private readonly logger: Logger) {}
 
-  async launch(options: LaunchOptions): Promise<{ pid: number; port: number; exitPromise: Promise<ProcessExitInfo>; getLastOutput: () => string }> {
+  async launch(options: LaunchOptions): Promise<OpencodeServerLaunchResult> {
     this.validateFolder(options.folder)
 
     const logLevel = typeof options.logLevel === "string" ? options.logLevel.toUpperCase() : "DEBUG"
@@ -484,4 +502,165 @@ export class WorkspaceRuntime {
       throw new Error(`Path is not a directory: ${resolved}`)
     }
   }
+}
+
+export async function waitForOpencodeServerReadiness(params: OpencodeReadinessParams): Promise<string | undefined> {
+  await Promise.race([
+    waitForPortAvailability(params.port),
+    params.exitPromise.then((info) => {
+      throw buildOpencodeStartupError(
+        params.runtimeId,
+        "exited before becoming ready",
+        info,
+        params.getLastOutput(),
+      )
+    }),
+  ])
+
+  const version = await Promise.race([
+    probeOpencodeServerHealth(params.runtimeId, params.port, params.logger, params.authorizationHeader),
+    params.exitPromise.then((info) => {
+      throw buildOpencodeStartupError(
+        params.runtimeId,
+        "exited during health checks",
+        info,
+        params.getLastOutput(),
+      )
+    }),
+  ])
+
+  if (!version.ok) {
+    const latestOutput = params.getLastOutput().trim()
+    if (latestOutput) {
+      throw new Error(latestOutput)
+    }
+    const reason = version.reason ?? "Health check failed"
+    throw new Error(`OpenCode runtime ${params.runtimeId} failed health check: ${reason}.`)
+  }
+
+  await Promise.race([
+    delay(STARTUP_STABILITY_DELAY_MS),
+    params.exitPromise.then((info) => {
+      throw buildOpencodeStartupError(
+        params.runtimeId,
+        "exited shortly after start",
+        info,
+        params.getLastOutput(),
+      )
+    }),
+  ])
+
+  return version.version
+}
+
+async function probeOpencodeServerHealth(
+  runtimeId: string,
+  port: number,
+  logger: Logger,
+  authorizationHeader?: string,
+): Promise<{ ok: boolean; reason?: string; version?: string }> {
+  const url = `http://127.0.0.1:${port}/global/health`
+
+  try {
+    const headers: Record<string, string> = {}
+    if (authorizationHeader) {
+      headers.Authorization = authorizationHeader
+    }
+
+    const response = await fetch(url, { headers })
+    if (!response.ok) {
+      const reason = `/global/health returned HTTP ${response.status}`
+      logger.debug({ runtimeId, status: response.status }, "Health probe returned server error")
+      return { ok: false, reason }
+    }
+
+    const payload = (await response.json().catch(() => null)) as null | { healthy?: unknown; version?: unknown }
+    const healthy = payload?.healthy === true
+    const version = typeof payload?.version === "string" ? payload.version.trim() : undefined
+
+    if (!healthy) {
+      const reason = "Instance reported unhealthy"
+      logger.debug({ runtimeId, payload }, "Health probe returned unhealthy response")
+      return { ok: false, reason }
+    }
+
+    return { ok: true, version: version || undefined }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    logger.debug({ runtimeId, err: error }, "Health probe failed")
+    return { ok: false, reason }
+  }
+}
+
+function buildOpencodeStartupError(
+  runtimeId: string,
+  phase: string,
+  exitInfo: ProcessExitInfo,
+  lastOutput: string,
+): Error {
+  const exitDetails = describeExit(exitInfo)
+  const trimmedOutput = lastOutput.trim()
+  const outputDetails = trimmedOutput ? ` Last output: ${trimmedOutput}` : ""
+  return new Error(`OpenCode runtime ${runtimeId} ${phase} (${exitDetails}).${outputDetails}`)
+}
+
+function waitForPortAvailability(port: number, timeoutMs = 5000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs
+    let settled = false
+    let retryTimer: NodeJS.Timeout | null = null
+
+    const cleanup = () => {
+      settled = true
+      if (retryTimer) {
+        clearTimeout(retryTimer)
+        retryTimer = null
+      }
+    }
+
+    const tryConnect = () => {
+      if (settled) {
+        return
+      }
+      const socket = connect({ port, host: "127.0.0.1" }, () => {
+        cleanup()
+        socket.end()
+        resolve()
+      })
+      socket.once("error", () => {
+        socket.destroy()
+        if (settled) {
+          return
+        }
+        if (Date.now() >= deadline) {
+          cleanup()
+          reject(new Error(`Workspace port ${port} did not become ready within ${timeoutMs}ms`))
+        } else {
+          retryTimer = setTimeout(() => {
+            retryTimer = null
+            tryConnect()
+          }, 100)
+        }
+      })
+    }
+
+    tryConnect()
+  })
+}
+
+function delay(durationMs: number): Promise<void> {
+  if (durationMs <= 0) {
+    return Promise.resolve()
+  }
+  return new Promise((resolve) => setTimeout(resolve, durationMs))
+}
+
+function describeExit(info: ProcessExitInfo): string {
+  if (info.signal) {
+    return `signal ${info.signal}`
+  }
+  if (info.code !== null) {
+    return `code ${info.code}`
+  }
+  return "unknown reason"
 }

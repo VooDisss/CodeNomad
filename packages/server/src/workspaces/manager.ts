@@ -1,6 +1,4 @@
 import path from "path"
-import { spawnSync } from "child_process"
-import { connect } from "net"
 import { EventBus } from "../events/bus"
 import type { SettingsService } from "../settings/service"
 import type { BinaryResolver } from "../settings/binaries"
@@ -8,9 +6,11 @@ import { FileSystemBrowser } from "../filesystem/browser"
 import { searchWorkspaceFiles, WorkspaceFileSearchOptions } from "../filesystem/search"
 import { clearWorkspaceSearchCache } from "../filesystem/search-cache"
 import { WorkspaceDescriptor, WorkspaceFileResponse, FileSystemEntry } from "../api-types"
-import { WorkspaceRuntime, ProcessExitInfo } from "./runtime"
+import { WorkspaceRuntime, ProcessExitInfo, waitForOpencodeServerReadiness } from "./runtime"
 import { Logger } from "../logger"
 import { getOpencodeConfigDir } from "../opencode-config.js"
+import { SharedOpencodeHostManager } from "./shared-host"
+import { resolveBinaryPath } from "./binary-path"
 import {
   buildOpencodeBasicAuthHeader,
   DEFAULT_OPENCODE_USERNAME,
@@ -18,8 +18,6 @@ import {
   OPENCODE_SERVER_PASSWORD_ENV,
   OPENCODE_SERVER_USERNAME_ENV,
 } from "./opencode-auth"
-
-const STARTUP_STABILITY_DELAY_MS = 1500
 
 interface WorkspaceManagerOptions {
   rootDir: string
@@ -37,11 +35,13 @@ interface WorkspaceRecord extends WorkspaceDescriptor {}
 export class WorkspaceManager {
   private readonly workspaces = new Map<string, WorkspaceRecord>()
   private readonly runtime: WorkspaceRuntime
+  private readonly sharedHost: SharedOpencodeHostManager
   private readonly opencodeConfigDir: string
   private readonly opencodeAuth = new Map<string, { username: string; password: string; authorization: string }>()
 
   constructor(private readonly options: WorkspaceManagerOptions) {
     this.runtime = new WorkspaceRuntime(this.options.eventBus, this.options.logger)
+    this.sharedHost = new SharedOpencodeHostManager(this.options)
     this.opencodeConfigDir = getOpencodeConfigDir()
   }
 
@@ -59,6 +59,10 @@ export class WorkspaceManager {
 
   getInstanceAuthorizationHeader(id: string): string | undefined {
     return this.opencodeAuth.get(id)?.authorization
+  }
+
+  getSharedHostManager(): SharedOpencodeHostManager {
+    return this.sharedHost
   }
 
   listFiles(workspaceId: string, relativePath = "."): FileSystemEntry[] {
@@ -93,7 +97,7 @@ export class WorkspaceManager {
  
     const id = `${Date.now().toString(36)}`
     const binary = this.options.binaryResolver.resolveDefault()
-    const resolvedBinaryPath = this.resolveBinaryPath(binary.path)
+    const resolvedBinaryPath = resolveBinaryPath(binary.path, this.options.logger)
     const workspacePath = path.isAbsolute(folder) ? folder : path.resolve(this.options.rootDir, folder)
     clearWorkspaceSearchCache(workspacePath)
 
@@ -233,234 +237,20 @@ export class WorkspaceManager {
     return workspace
   }
 
-  private resolveBinaryPath(identifier: string): string {
-    if (!identifier) {
-      return identifier
-    }
-
-    const looksLikePath = identifier.includes("/") || identifier.includes("\\") || identifier.startsWith(".")
-    if (path.isAbsolute(identifier) || looksLikePath) {
-      return identifier
-    }
-
-    const locator = process.platform === "win32" ? "where" : "which"
-
-    try {
-      const result = spawnSync(locator, [identifier], { encoding: "utf8" })
-      if (result.status === 0 && result.stdout) {
-        const candidates = result.stdout
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0)
-          .filter((line) => !/^INFO:/i.test(line))
-
-        if (candidates.length > 0) {
-          const resolved = this.pickBinaryCandidate(candidates)
-          this.options.logger.debug({ identifier, resolved, candidates }, "Resolved binary path from system PATH")
-          return resolved
-        }
-      } else if (result.error) {
-        this.options.logger.warn({ identifier, err: result.error }, "Failed to resolve binary path via locator command")
-      }
-    } catch (error) {
-      this.options.logger.warn({ identifier, err: error }, "Failed to resolve binary path from system PATH")
-    }
-
-    return identifier
-  }
-
-  private pickBinaryCandidate(candidates: string[]): string {
-    if (process.platform !== "win32") {
-      return candidates[0] ?? ""
-    }
-
-    const extensionPreference = [".exe", ".cmd", ".bat", ".ps1"]
-
-    for (const ext of extensionPreference) {
-      const match = candidates.find((candidate) => candidate.toLowerCase().endsWith(ext))
-      if (match) {
-        return match
-      }
-    }
-
-    return candidates[0] ?? ""
-  }
-
   private async waitForWorkspaceReadiness(params: {
     workspaceId: string
     port: number
     exitPromise: Promise<ProcessExitInfo>
     getLastOutput: () => string
   }): Promise<string | undefined> {
-
-    await Promise.race([
-      this.waitForPortAvailability(params.port),
-      params.exitPromise.then((info) => {
-        throw this.buildStartupError(
-          params.workspaceId,
-          "exited before becoming ready",
-          info,
-          params.getLastOutput(),
-        )
-      }),
-    ])
-
-    const version = await this.waitForInstanceHealth(params)
-
-    await Promise.race([
-      this.delay(STARTUP_STABILITY_DELAY_MS),
-      params.exitPromise.then((info) => {
-        throw this.buildStartupError(
-          params.workspaceId,
-          "exited shortly after start",
-          info,
-          params.getLastOutput(),
-        )
-      }),
-    ])
-
-    return version
-  }
-
-  private async waitForInstanceHealth(params: {
-    workspaceId: string
-    port: number
-    exitPromise: Promise<ProcessExitInfo>
-    getLastOutput: () => string
-  }): Promise<string | undefined> {
-    const probeResult = await Promise.race([
-      this.probeInstance(params.workspaceId, params.port),
-      params.exitPromise.then((info) => {
-        throw this.buildStartupError(
-          params.workspaceId,
-          "exited during health checks",
-          info,
-          params.getLastOutput(),
-        )
-      }),
-    ])
-
-    if (probeResult.ok) {
-      return probeResult.version
-    }
-
-    const latestOutput = params.getLastOutput().trim()
-    if (latestOutput) {
-      throw new Error(latestOutput)
-    }
-    const reason = probeResult.reason ?? "Health check failed"
-    throw new Error(`Workspace ${params.workspaceId} failed health check: ${reason}.`)
-  }
-
-  private async probeInstance(
-    workspaceId: string,
-    port: number,
-  ): Promise<{ ok: boolean; reason?: string; version?: string }> {
-    const url = `http://127.0.0.1:${port}/global/health`
-
-    try {
-      const headers: Record<string, string> = {}
-      const authHeader = this.opencodeAuth.get(workspaceId)?.authorization
-      if (authHeader) {
-        headers["Authorization"] = authHeader
-      }
-
-      const response = await fetch(url, { headers })
-      if (!response.ok) {
-        const reason = `/global/health returned HTTP ${response.status}`
-        this.options.logger.debug({ workspaceId, status: response.status }, "Health probe returned server error")
-        return { ok: false, reason }
-      }
-
-      const payload = (await response.json().catch(() => null)) as null | { healthy?: unknown; version?: unknown }
-      const healthy = payload?.healthy === true
-      const version = typeof payload?.version === "string" ? payload.version.trim() : undefined
-
-      if (!healthy) {
-        const reason = "Instance reported unhealthy"
-        this.options.logger.debug({ workspaceId, payload }, "Health probe returned unhealthy response")
-        return { ok: false, reason }
-      }
-
-      return { ok: true, version: version || undefined }
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error)
-      this.options.logger.debug({ workspaceId, err: error }, "Health probe failed")
-      return { ok: false, reason }
-    }
-  }
-
-  private buildStartupError(
-    workspaceId: string,
-    phase: string,
-    exitInfo: ProcessExitInfo,
-    lastOutput: string,
-  ): Error {
-    const exitDetails = this.describeExit(exitInfo)
-    const trimmedOutput = lastOutput.trim()
-    const outputDetails = trimmedOutput ? ` Last output: ${trimmedOutput}` : ""
-    return new Error(`Workspace ${workspaceId} ${phase} (${exitDetails}).${outputDetails}`)
-  }
-
-  private waitForPortAvailability(port: number, timeoutMs = 5000): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const deadline = Date.now() + timeoutMs
-      let settled = false
-      let retryTimer: NodeJS.Timeout | null = null
-
-      const cleanup = () => {
-        settled = true
-        if (retryTimer) {
-          clearTimeout(retryTimer)
-          retryTimer = null
-        }
-      }
-
-      const tryConnect = () => {
-        if (settled) {
-          return
-        }
-        const socket = connect({ port, host: "127.0.0.1" }, () => {
-          cleanup()
-          socket.end()
-          resolve()
-        })
-        socket.once("error", () => {
-          socket.destroy()
-          if (settled) {
-            return
-          }
-          if (Date.now() >= deadline) {
-            cleanup()
-            reject(new Error(`Workspace port ${port} did not become ready within ${timeoutMs}ms`))
-          } else {
-            retryTimer = setTimeout(() => {
-              retryTimer = null
-              tryConnect()
-            }, 100)
-          }
-        })
-      }
-
-      tryConnect()
+    return waitForOpencodeServerReadiness({
+      runtimeId: params.workspaceId,
+      port: params.port,
+      exitPromise: params.exitPromise,
+      getLastOutput: params.getLastOutput,
+      logger: this.options.logger,
+      authorizationHeader: this.opencodeAuth.get(params.workspaceId)?.authorization,
     })
-  }
-
-  private delay(durationMs: number): Promise<void> {
-    if (durationMs <= 0) {
-      return Promise.resolve()
-    }
-    return new Promise((resolve) => setTimeout(resolve, durationMs))
-  }
-
-  private describeExit(info: ProcessExitInfo): string {
-    if (info.signal) {
-      return `signal ${info.signal}`
-    }
-    if (info.code !== null) {
-      return `code ${info.code}`
-    }
-    return "unknown reason"
   }
 
   private handleProcessExit(workspaceId: string, info: { code: number | null; requested: boolean }) {
