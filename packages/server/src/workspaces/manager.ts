@@ -9,7 +9,6 @@ import { WorkspaceDescriptor, WorkspaceFileResponse, FileSystemEntry } from "../
 import { Logger } from "../logger"
 import { SharedHostInfo, SharedOpencodeHostManager } from "./shared-host"
 import { resolveBinaryPath } from "./binary-path"
-import { DedicatedWorkspaceHostManager } from "./workspace-hosts"
 
 interface WorkspaceManagerOptions {
   rootDir: string
@@ -26,13 +25,9 @@ interface WorkspaceRecord extends WorkspaceDescriptor {}
 
 export class WorkspaceManager {
   private readonly workspaces = new Map<string, WorkspaceRecord>()
-  private readonly workspaceHosts: DedicatedWorkspaceHostManager
   private readonly sharedHost: SharedOpencodeHostManager
 
   constructor(private readonly options: WorkspaceManagerOptions) {
-    this.workspaceHosts = new DedicatedWorkspaceHostManager(this.options, (workspaceId, info) =>
-      this.handleProcessExit(workspaceId, info),
-    )
     this.sharedHost = new SharedOpencodeHostManager(this.options)
   }
 
@@ -72,11 +67,16 @@ export class WorkspaceManager {
   }
 
   getInstancePort(id: string): number | undefined {
-    return this.workspaceHosts.getHostInfo(id)?.port
+    return this.workspaces.get(id)?.port
   }
 
   getInstanceAuthorizationHeader(id: string): string | undefined {
-    return this.workspaceHosts.getAuthorizationHeader(id)
+    const workspace = this.workspaces.get(id)
+    if (!workspace || workspace.status !== "ready") {
+      return undefined
+    }
+
+    return this.sharedHost.getInfo()?.authorization
   }
 
   getSharedHostManager(): SharedOpencodeHostManager {
@@ -144,24 +144,19 @@ export class WorkspaceManager {
     this.options.eventBus.publish({ type: "workspace.created", workspace: descriptor })
 
     try {
-      await this.sharedHost.ensureStarted()
+      const hostInfo = await this.sharedHost.ensureStarted()
 
-      const hostInfo = await this.workspaceHosts.startWorkspaceHost({
-        workspaceId: id,
-        workspacePath,
-      })
-
-      descriptor.binaryId = hostInfo.binaryPath
-      descriptor.binaryVersion = hostInfo.binaryVersion ?? descriptor.binaryVersion
-      descriptor.pid = hostInfo.pid
-      descriptor.port = hostInfo.port
+      this.applySharedHostDescriptorState(descriptor, hostInfo)
       descriptor.status = "ready"
+      descriptor.error = undefined
       descriptor.updatedAt = new Date().toISOString()
       this.options.eventBus.publish({ type: "workspace.started", workspace: descriptor })
-      this.options.logger.info({ workspaceId: id, port: hostInfo.port }, "Workspace ready")
+      this.options.logger.info({ workspaceId: id, sharedHostPort: hostInfo.port }, "Workspace ready")
       return descriptor
     } catch (error) {
       descriptor.status = "error"
+      descriptor.pid = undefined
+      descriptor.port = undefined
       descriptor.error = error instanceof Error ? error.message : String(error)
       descriptor.updatedAt = new Date().toISOString()
       this.options.eventBus.publish({ type: "workspace.error", workspace: descriptor })
@@ -175,28 +170,26 @@ export class WorkspaceManager {
     if (!workspace) return undefined
 
     this.options.logger.info({ workspaceId: id }, "Stopping workspace")
-    const wasRunning = Boolean(this.workspaceHosts.getHostInfo(id))
-    if (wasRunning) {
-      await this.workspaceHosts.stopWorkspaceHost(id).catch((error) => {
-        this.options.logger.warn({ workspaceId: id, err: error }, "Failed to stop workspace process cleanly")
-      })
-    }
 
     this.workspaces.delete(id)
     clearWorkspaceSearchCache(workspace.path)
-    if (!wasRunning) {
-      this.options.eventBus.publish({ type: "workspace.stopped", workspaceId: id })
-    }
+    this.options.eventBus.publish({ type: "workspace.stopped", workspaceId: id })
     return workspace
   }
 
   async shutdown() {
     this.options.logger.info("Shutting down all workspaces")
 
-    await this.workspaceHosts.shutdown()
     await this.sharedHost.shutdown().catch((error) => {
       this.options.logger.error({ err: error }, "Failed to stop shared host during shutdown")
     })
+
+    for (const workspace of this.workspaces.values()) {
+      workspace.status = "stopped"
+      workspace.pid = undefined
+      workspace.port = undefined
+      workspace.updatedAt = new Date().toISOString()
+    }
 
     this.workspaces.clear()
     this.options.logger.info("All workspaces cleared")
@@ -210,25 +203,12 @@ export class WorkspaceManager {
     return workspace
   }
 
-  private handleProcessExit(workspaceId: string, info: { code: number | null; requested: boolean }) {
-    const workspace = this.workspaces.get(workspaceId)
-    if (!workspace) return
-
-    this.options.logger.info({ workspaceId, ...info }, "Workspace process exited")
-
-    workspace.pid = undefined
-    workspace.port = undefined
-    workspace.updatedAt = new Date().toISOString()
-
-    if (info.requested || info.code === 0) {
-      workspace.status = "stopped"
-      workspace.error = undefined
-      this.options.eventBus.publish({ type: "workspace.stopped", workspaceId })
-    } else {
-      workspace.status = "error"
-      workspace.error = `Process exited with code ${info.code}`
-      this.options.eventBus.publish({ type: "workspace.error", workspace })
-    }
+  private applySharedHostDescriptorState(workspace: WorkspaceRecord, hostInfo: SharedHostInfo) {
+    // `pid`/`port` remain populated for UI compatibility, but now describe the shared host.
+    workspace.binaryId = hostInfo.binaryPath
+    workspace.binaryVersion = hostInfo.binaryVersion ?? workspace.binaryVersion
+    workspace.pid = hostInfo.pid
+    workspace.port = hostInfo.port
   }
 }
 
