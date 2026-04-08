@@ -28,7 +28,10 @@ export class WorkspaceManager {
   private readonly sharedHost: SharedOpencodeHostManager
 
   constructor(private readonly options: WorkspaceManagerOptions) {
-    this.sharedHost = new SharedOpencodeHostManager(this.options)
+    this.sharedHost = new SharedOpencodeHostManager({
+      ...this.options,
+      onExit: (info) => this.handleSharedHostExit(info),
+    })
   }
 
   list(): WorkspaceDescriptor[] {
@@ -76,6 +79,10 @@ export class WorkspaceManager {
       return undefined
     }
 
+    if (this.sharedHost.getOwnerWorkspaceId() !== id) {
+      return undefined
+    }
+
     return this.sharedHost.getInfo()?.authorization
   }
 
@@ -84,7 +91,11 @@ export class WorkspaceManager {
   }
 
   async ensureSharedHostReady(): Promise<SharedHostInfo> {
-    return this.sharedHost.ensureStarted()
+    const ownerWorkspaceId = this.sharedHost.getOwnerWorkspaceId() ?? this.workspaces.keys().next().value
+    if (!ownerWorkspaceId) {
+      throw new Error("No workspace available to start shared host")
+    }
+    return this.sharedHost.ensureStarted(ownerWorkspaceId)
   }
 
   listFiles(workspaceId: string, relativePath = "."): FileSystemEntry[] {
@@ -144,7 +155,7 @@ export class WorkspaceManager {
     this.options.eventBus.publish({ type: "workspace.created", workspace: descriptor })
 
     try {
-      const hostInfo = await this.sharedHost.ensureStarted()
+      const hostInfo = await this.sharedHost.ensureStarted(id)
 
       this.applySharedHostDescriptorState(descriptor, hostInfo)
       descriptor.status = "ready"
@@ -174,6 +185,13 @@ export class WorkspaceManager {
     this.workspaces.delete(id)
     clearWorkspaceSearchCache(workspace.path)
     this.options.eventBus.publish({ type: "workspace.stopped", workspaceId: id })
+
+    if (this.workspaces.size === 0) {
+      await this.sharedHost.shutdown().catch((error) => {
+        this.options.logger.error({ err: error }, "Failed to stop shared host after deleting final workspace")
+      })
+    }
+
     return workspace
   }
 
@@ -209,6 +227,26 @@ export class WorkspaceManager {
     workspace.binaryVersion = hostInfo.binaryVersion ?? workspace.binaryVersion
     workspace.pid = hostInfo.pid
     workspace.port = hostInfo.port
+  }
+
+  private handleSharedHostExit(info: { code: number | null; requested: boolean }) {
+    for (const workspace of this.workspaces.values()) {
+      this.options.logger.info({ workspaceId: workspace.id, ...info }, "Shared host exit updated workspace state")
+
+      workspace.pid = undefined
+      workspace.port = undefined
+      workspace.updatedAt = new Date().toISOString()
+
+      if (info.requested || info.code === 0) {
+        workspace.status = "stopped"
+        workspace.error = undefined
+        this.options.eventBus.publish({ type: "workspace.stopped", workspaceId: workspace.id })
+      } else {
+        workspace.status = "error"
+        workspace.error = `Shared host exited with code ${info.code}`
+        this.options.eventBus.publish({ type: "workspace.error", workspace })
+      }
+    }
   }
 }
 

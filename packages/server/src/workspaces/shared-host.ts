@@ -34,6 +34,7 @@ interface SharedOpencodeHostManagerOptions {
   logger: Logger
   getServerBaseUrl: () => string
   nodeExtraCaCertsPath?: string
+  onExit?: (info: { code: number | null; requested: boolean }) => void
 }
 
 export class SharedOpencodeHostManager {
@@ -43,6 +44,7 @@ export class SharedOpencodeHostManager {
   private startPromise: Promise<SharedHostInfo> | null = null
   private info: SharedHostInfo | null = null
   private authorization: string | null = null
+  private ownerWorkspaceId: string | null = null
 
   constructor(private readonly options: SharedOpencodeHostManagerOptions) {
     this.runtime = new WorkspaceRuntime(this.options.eventBus, this.options.logger)
@@ -58,9 +60,17 @@ export class SharedOpencodeHostManager {
     return this.info !== null
   }
 
-  async ensureStarted(): Promise<SharedHostInfo> {
+  getOwnerWorkspaceId(): string | null {
+    return this.ownerWorkspaceId
+  }
+
+  async ensureStarted(ownerWorkspaceId: string): Promise<SharedHostInfo> {
     if (this.info) {
       return this.info
+    }
+
+    if (!this.ownerWorkspaceId) {
+      this.ownerWorkspaceId = ownerWorkspaceId
     }
 
     if (!this.startPromise) {
@@ -83,6 +93,7 @@ export class SharedOpencodeHostManager {
     } finally {
       this.info = null
       this.authorization = null
+      this.ownerWorkspaceId = null
     }
   }
 
@@ -112,6 +123,7 @@ export class SharedOpencodeHostManager {
         environment: {
           ...userEnvironment,
           OPENCODE_CONFIG_DIR: this.opencodeConfigDir,
+          ...(this.ownerWorkspaceId ? { CODENOMAD_INSTANCE_ID: this.ownerWorkspaceId } : {}),
           CODENOMAD_BASE_URL: this.options.getServerBaseUrl(),
           ...(this.options.nodeExtraCaCertsPath ? { NODE_EXTRA_CA_CERTS: this.options.nodeExtraCaCertsPath } : {}),
           [OPENCODE_SERVER_USERNAME_ENV]: opencodeUsername,
@@ -162,5 +174,7 @@ export class SharedOpencodeHostManager {
     this.logger.info({ code, requested }, "Shared OpenCode host exited")
     this.info = null
     this.authorization = null
+    this.ownerWorkspaceId = null
+    this.options.onExit?.({ code, requested })
   }
 }
