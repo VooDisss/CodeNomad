@@ -6,18 +6,10 @@ import { FileSystemBrowser } from "../filesystem/browser"
 import { searchWorkspaceFiles, WorkspaceFileSearchOptions } from "../filesystem/search"
 import { clearWorkspaceSearchCache } from "../filesystem/search-cache"
 import { WorkspaceDescriptor, WorkspaceFileResponse, FileSystemEntry } from "../api-types"
-import { WorkspaceRuntime, ProcessExitInfo, waitForOpencodeServerReadiness } from "./runtime"
 import { Logger } from "../logger"
-import { getOpencodeConfigDir } from "../opencode-config.js"
 import { SharedOpencodeHostManager } from "./shared-host"
 import { resolveBinaryPath } from "./binary-path"
-import {
-  buildOpencodeBasicAuthHeader,
-  DEFAULT_OPENCODE_USERNAME,
-  generateOpencodeServerPassword,
-  OPENCODE_SERVER_PASSWORD_ENV,
-  OPENCODE_SERVER_USERNAME_ENV,
-} from "./opencode-auth"
+import { DedicatedWorkspaceHostManager } from "./workspace-hosts"
 
 interface WorkspaceManagerOptions {
   rootDir: string
@@ -34,15 +26,14 @@ interface WorkspaceRecord extends WorkspaceDescriptor {}
 
 export class WorkspaceManager {
   private readonly workspaces = new Map<string, WorkspaceRecord>()
-  private readonly runtime: WorkspaceRuntime
+  private readonly workspaceHosts: DedicatedWorkspaceHostManager
   private readonly sharedHost: SharedOpencodeHostManager
-  private readonly opencodeConfigDir: string
-  private readonly opencodeAuth = new Map<string, { username: string; password: string; authorization: string }>()
 
   constructor(private readonly options: WorkspaceManagerOptions) {
-    this.runtime = new WorkspaceRuntime(this.options.eventBus, this.options.logger)
+    this.workspaceHosts = new DedicatedWorkspaceHostManager(this.options, (workspaceId, info) =>
+      this.handleProcessExit(workspaceId, info),
+    )
     this.sharedHost = new SharedOpencodeHostManager(this.options)
-    this.opencodeConfigDir = getOpencodeConfigDir()
   }
 
   list(): WorkspaceDescriptor[] {
@@ -54,11 +45,11 @@ export class WorkspaceManager {
   }
 
   getInstancePort(id: string): number | undefined {
-    return this.workspaces.get(id)?.port
+    return this.workspaceHosts.getHostInfo(id)?.port
   }
 
   getInstanceAuthorizationHeader(id: string): string | undefined {
-    return this.opencodeAuth.get(id)?.authorization
+    return this.workspaceHosts.getAuthorizationHeader(id)
   }
 
   getSharedHostManager(): SharedOpencodeHostManager {
@@ -94,17 +85,15 @@ export class WorkspaceManager {
   }
 
   async create(folder: string, name?: string): Promise<WorkspaceDescriptor> {
- 
     const id = `${Date.now().toString(36)}`
     const binary = this.options.binaryResolver.resolveDefault()
     const resolvedBinaryPath = resolveBinaryPath(binary.path, this.options.logger)
     const workspacePath = path.isAbsolute(folder) ? folder : path.resolve(this.options.rootDir, folder)
     clearWorkspaceSearchCache(workspacePath)
 
-    this.options.logger.info({ workspaceId: id, folder: workspacePath, binary: resolvedBinaryPath }, "Creating workspace")
+    this.options.logger.info({ workspaceId: id, folder: workspacePath }, "Creating workspace")
 
     const proxyPath = `/workspaces/${id}/worktrees/root/instance`
-
 
     const descriptor: WorkspaceRecord = {
       id,
@@ -121,54 +110,22 @@ export class WorkspaceManager {
 
     this.workspaces.set(id, descriptor)
 
-
     this.options.eventBus.publish({ type: "workspace.created", workspace: descriptor })
 
-    const serverConfig = this.options.settings.getOwner("config", "server")
-    const envVars = (serverConfig as any)?.environmentVariables
-    const userEnvironment = envVars && typeof envVars === "object" && !Array.isArray(envVars) ? (envVars as any) : {}
-
-    const opencodeUsername = DEFAULT_OPENCODE_USERNAME
-    const opencodePassword = generateOpencodeServerPassword()
-    const authorization = buildOpencodeBasicAuthHeader({ username: opencodeUsername, password: opencodePassword })
-    if (!authorization) {
-      throw new Error("Failed to build OpenCode auth header")
-    }
-    this.opencodeAuth.set(id, { username: opencodeUsername, password: opencodePassword, authorization })
-
-    const environment = {
-      ...userEnvironment,
-      OPENCODE_CONFIG_DIR: this.opencodeConfigDir,
-      CODENOMAD_INSTANCE_ID: id,
-      CODENOMAD_BASE_URL: this.options.getServerBaseUrl(),
-      ...(this.options.nodeExtraCaCertsPath ? { NODE_EXTRA_CA_CERTS: this.options.nodeExtraCaCertsPath } : {}),
-      [OPENCODE_SERVER_USERNAME_ENV]: opencodeUsername,
-      [OPENCODE_SERVER_PASSWORD_ENV]: opencodePassword,
-    }
-
-    const logLevel = (serverConfig as any)?.logLevel
-
     try {
-      const { pid, port, exitPromise, getLastOutput } = await this.runtime.launch({
+      const hostInfo = await this.workspaceHosts.startWorkspaceHost({
         workspaceId: id,
-        folder: workspacePath,
-        binaryPath: resolvedBinaryPath,
-        environment,
-        logLevel,
-        onExit: (info) => this.handleProcessExit(info.workspaceId, info),
+        workspacePath,
       })
 
-      const runtimeVersion = await this.waitForWorkspaceReadiness({ workspaceId: id, port, exitPromise, getLastOutput })
-      if (runtimeVersion) {
-        descriptor.binaryVersion = runtimeVersion
-      }
-
-      descriptor.pid = pid
-      descriptor.port = port
+      descriptor.binaryId = hostInfo.binaryPath
+      descriptor.binaryVersion = hostInfo.binaryVersion ?? descriptor.binaryVersion
+      descriptor.pid = hostInfo.pid
+      descriptor.port = hostInfo.port
       descriptor.status = "ready"
       descriptor.updatedAt = new Date().toISOString()
       this.options.eventBus.publish({ type: "workspace.started", workspace: descriptor })
-      this.options.logger.info({ workspaceId: id, port }, "Workspace ready")
+      this.options.logger.info({ workspaceId: id, port: hostInfo.port }, "Workspace ready")
       return descriptor
     } catch (error) {
       descriptor.status = "error"
@@ -185,15 +142,14 @@ export class WorkspaceManager {
     if (!workspace) return undefined
 
     this.options.logger.info({ workspaceId: id }, "Stopping workspace")
-    const wasRunning = Boolean(workspace.pid)
+    const wasRunning = Boolean(this.workspaceHosts.getHostInfo(id))
     if (wasRunning) {
-      await this.runtime.stop(id).catch((error) => {
+      await this.workspaceHosts.stopWorkspaceHost(id).catch((error) => {
         this.options.logger.warn({ workspaceId: id, err: error }, "Failed to stop workspace process cleanly")
       })
     }
 
     this.workspaces.delete(id)
-    this.opencodeAuth.delete(id)
     clearWorkspaceSearchCache(workspace.path)
     if (!wasRunning) {
       this.options.eventBus.publish({ type: "workspace.stopped", workspaceId: id })
@@ -204,28 +160,12 @@ export class WorkspaceManager {
   async shutdown() {
     this.options.logger.info("Shutting down all workspaces")
 
-    const stopTasks: Array<Promise<void>> = []
-
-    for (const [id, workspace] of this.workspaces) {
-      if (!workspace.pid) {
-        this.options.logger.debug({ workspaceId: id }, "Workspace already stopped")
-        continue
-      }
-
-      this.options.logger.info({ workspaceId: id }, "Stopping workspace during shutdown")
-      stopTasks.push(
-        this.runtime.stop(id).catch((error) => {
-          this.options.logger.error({ workspaceId: id, err: error }, "Failed to stop workspace during shutdown")
-        }),
-      )
-    }
-
-    if (stopTasks.length > 0) {
-      await Promise.allSettled(stopTasks)
-    }
+    await this.workspaceHosts.shutdown()
+    await this.sharedHost.shutdown().catch((error) => {
+      this.options.logger.error({ err: error }, "Failed to stop shared host during shutdown")
+    })
 
     this.workspaces.clear()
-    this.opencodeAuth.clear()
     this.options.logger.info("All workspaces cleared")
   }
 
@@ -237,27 +177,9 @@ export class WorkspaceManager {
     return workspace
   }
 
-  private async waitForWorkspaceReadiness(params: {
-    workspaceId: string
-    port: number
-    exitPromise: Promise<ProcessExitInfo>
-    getLastOutput: () => string
-  }): Promise<string | undefined> {
-    return waitForOpencodeServerReadiness({
-      runtimeId: params.workspaceId,
-      port: params.port,
-      exitPromise: params.exitPromise,
-      getLastOutput: params.getLastOutput,
-      logger: this.options.logger,
-      authorizationHeader: this.opencodeAuth.get(params.workspaceId)?.authorization,
-    })
-  }
-
   private handleProcessExit(workspaceId: string, info: { code: number | null; requested: boolean }) {
     const workspace = this.workspaces.get(workspaceId)
     if (!workspace) return
-
-    this.opencodeAuth.delete(workspaceId)
 
     this.options.logger.info({ workspaceId, ...info }, "Workspace process exited")
 
